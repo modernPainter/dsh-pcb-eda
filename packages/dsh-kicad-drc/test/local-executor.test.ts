@@ -53,3 +53,21 @@ test('LocalExecutor.run kicad-cli 解析失败时报错（懒解析生效）', a
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+test('LocalExecutor：解析失败后在冷却期内复用失败结果（probe 快速返回不可用）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kicad-drc-test-'))
+  try {
+    const pcb = join(dir, 'board.kicad_pcb')
+    writeFileSync(pcb, '(kicad_pcb (version 20241120))')
+    const executor = new LocalExecutor(join(tmpdir(), 'no-such-kicad-cli-xyz.exe'))
+
+    await assert.rejects(executor.run({ pcbPath: pcb }), /kicad-cli/)
+    // 第二次探测应命中失败缓存，不再重跑探测链
+    const health = await executor.probe()
+    assert.equal(health.available, false)
+    assert.match(String(health.reason), /kicad-cli/)
+    await assert.rejects(executor.run({ pcbPath: pcb }), /kicad-cli/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})

@@ -7,27 +7,105 @@ DeepSeek Harness (DSH) 插件：为 AI agent 注册 `kicad_drc_run` 工具，对
 - 一次工具调用执行 `kicad-cli pcb drc --format json`，返回：
   - `drcSummary` — 错误/警告/排除数量、按类型分类计数、前 5 条示例错误、已忽略检查项
   - `drcJsonPath` — 完整报告持久化在 PCB 文件同目录（`<pcb名>_drc.json`），可直接读取
+  - `verifiedBy` — 本次实际由哪个后端执行、耗时、选择原因（跨后端结果不可直接比较，必读）
   - `drcJson` — 原始 JSON，**默认不回传**（可能数百 KB），传 `includeFullJson=true` 才包含
-- 两种执行模式：
+- 三个后端 + 运行时自适应（`mode` 参数可覆盖，默认 `auto`）：
   - **local** — 本地 subprocess 直接调 kicad-cli；可执行文件多级自动探测（插件配置 → `KICAD_CLI_PATH`/`KICAD_PATH` 环境变量 → PATH → Windows 注册表 → 常见安装目录扫描 → PowerShell 全盘浅层搜索）
-  - **remote**（默认）— PCB 文件 multipart 上传到 pcblint-java 服务，由其转发 cli-runner 执行；本机无需安装 KiCad
-- HTTP 瞬时失败自动重试一次（网络错误 / 5xx；超时中止不重试）
-- kicad-cli 懒解析：本机没装 KiCad 不会拖垮插件启动，首次调用工具时才探测并返回结构化错误
+  - **remote** — PCB 文件 multipart 上传到 pcblint-java 服务，由其转发 cli-runner 执行；本机无需安装 KiCad
+  - **ipc** — 通过 IPC 让**正在运行的 KiCad** 执行 DRC 并取回结构化结果（作用于内存中的板，含未保存修改；不产生 marker、不写盘）；结果接口 `RunDrc` 由华秋定制版 KiCad 提供，官方版没有这条命令时该后端会自动判为不可用
+- auto 模式按「可用性 → 预期耗时 → 工程规则完整性」选择，失败自动回退，实际后端写进 `verifiedBy`
+- 本地默认使用隔离的 `KICAD_CONFIG_HOME`，规避 KiCad 默认配置发现路径的开销（实测 6.1s → 1.2s）
+- 同一块板（路径 + mtime + 大小）在会话内粘滞于首次成功的后端，保证多次结果可比
+- `kicad_drc_backends` 工具可探测各后端可用性与预计耗时，便于有依据地指定 `mode`
+- HTTP 瞬时失败自动重试一次（网络错误 / 5xx；超时中止不重试）；远程失败后 60s 冷却期内降级
+- kicad-cli 懒解析：本机没装 KiCad 不会拖垮插件启动（失败结果缓存 60s，避免每次调用重跑全盘搜索）
 
 ## 工具：kicad_drc_run
 
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|:---:|------|
 | `pcbPath` | string | ✅ | `.kicad_pcb` 文件绝对路径（必须存在于本机文件系统） |
+| `mode` | string | – | `auto` / `local` / `remote` / `ipc`，默认取插件配置 `executorMode`（默认 auto） |
 | `severityAll` | boolean | – | 报告所有严重级别，默认 true |
 | `refillZones` | boolean | – | DRC 前重绘填充区，默认 true |
 | `allTrackErrors` | boolean | – | 报告所有走线错误，默认 false |
 | `includeFullJson` | boolean | – | 输出中包含 drc.json 原始 JSON（可能很大），默认 false |
 | `timeoutSeconds` | number | – | 超时秒数，默认 600 |
 
-输出字段：`success`、`exitCode`、`timedOut`、`elapsedMs`、`stdout`、`stderr`、`kicadCliPath`、`command`，以及可选的 `drcJsonPath` / `drcSummary` / `drcJson` / `viewUrl`（未生成报告时省略）。
+输出字段：`success`、`exitCode`、`timedOut`、`elapsedMs`、`stdout`、`stderr`、`kicadCliPath`、`command`、`verifiedBy`，以及可选的 `drcJsonPath` / `drcSummary` / `drcJson` / `viewUrl`（未生成报告时省略）。
 
 > **`success` 语义**：表示 DRC 运行是否正常完成（KiCad 10 实测：有无违规退出码都是 0），**不代表板子没有违规**——有无违规请判断 `drcSummary.totalIssues`。
+
+## 自适应选择与实测数据
+
+选择顺序（见 `src/adaptive-executor.ts`）：
+
+1. **硬约束** — 探测不可用（本机无 kicad-cli / 远程处于失败冷却）的后端直接出局
+2. **优先级分层** — `backendPriority` 决定先试谁，默认 `remote → local → ipc`；前一个不可用或执行失败，才降级到下一个
+3. **稳定打分** — 只在**同一层内**做次序：基础成本（local 1.5s / remote 9s）+ 上传体积惩罚 + 历史耗时；同分按固定顺序，**不随机**，保证同一块板两次调用结果可比
+4. **失败回退** — 仅 auto 模式；显式指定 `mode` 时不回退，直接报错（意图明确，静默换后端会掩盖问题）
+5. **同板粘滞** — 10 分钟内同一块板固定用首次成功的后端（优先于分层）
+
+> **口径差异**：在线只上传单个 `.kicad_pcb`，工程级 DRC 规则/网络类带不过去，违规条数可能与 local/ipc 不同。跨后端比较前先看 `verifiedBy`，别直接拿两个数字相减。
+
+实测（KiCad 10.0.6 / Windows / 405KB 板）：
+
+| 场景 | 耗时 | 结果 |
+|------|------|------|
+| 本地，默认配置 | 5.8s | 3 violations + 17 unconnected |
+| 本地，隔离配置 | **1.1s** | 逐字段一致（仅 `date` 不同） |
+| 远程 | 8~20s | 取决于上传与排队 |
+
+> 这 5s 差距来自 KiCad 的默认配置发现流程，而非 DRC 计算：`pcb export svg` 同样的板只要 0.6s，把 `KICAD_CONFIG_HOME` 显式指向原配置目录也只要 0.6s。隔离配置会失去用户的全局封装库表，依赖库比对的检查可能退化为默认结果——该板实测无差异，真实工程建议回归一次；可用 `isolatedConfig: false` 关闭。
+
+## 工具：kicad_drc_backends
+
+无参数，返回 `backends[]`：`backend` / `available` / `endpoint` / `estimatedMs` / `reason`。不执行 DRC、无副作用。一般无需先调用——留着是为了让 AI 在需要固定环境时能先看清能力边界。
+
+## kicad-ipc 后端（`mode: 'ipc'`）
+
+直接让运行中的 KiCad 跑 DRC：板子已在内存里，不用重新解析、不用存盘，也自动沿用当前工程规则——理论上是最快的一条路。
+
+**前置条件**（缺一不可，`kicad_drc_backends` 会逐条报出缺哪个）：
+
+1. KiCad 正在运行，且在 **Preferences → Plugins** 勾选 **启用 KiCad API**（写入 `kicad_common.json` 的 `api.enable_server`）；
+2. **KiCad 里已经打开了目标 PCB** —— 只有工程管理器窗口时，`GetOpenDocuments` 会返回 `no handler available`；
+3. `ipcPythonPath` 指向的 Python 能 `import kipy`（KiCad 自带解释器已内置）；
+4. 服务端是**华秋定制版 KiCad**，提供了 `kiapi.board.commands.RunDrc`（官方版没有这条命令）。
+
+**能力边界**：
+
+| 能力 | 官方 10.0.6 | 华秋定制版 |
+|---|---|---|
+| 连接 / `ping` / `GetVersion` / `GetOpenDocuments` | ✅ | ✅ |
+| 执行 DRC 并取回结构化结果（`RunDrc`） | ❌ `no handler available` | ✅ |
+| 读取 DRC marker | ❌ | ❌（不需要，结果直接从 `RunDrcResponse` 来） |
+
+探测阶段用一个**空的 `DocumentSpecifier`** 发一次 `RunDrc`：定制版会先校验文档、回 `the requested document is not open`，官方版则根本没有 handler、回 `no handler available`。据此判定能力，不跑真 DRC、无副作用。
+
+判定失败时 `probe()` 直接返回不可用（原因写进 `reason`，60s 冷却），于是 `auto` 自动退化成 local/remote 二选一。目标板与 KiCad 当前打开的板不一致时直接报错，绝不把别的板结果当答案。
+
+### 更新 IPC 协议（`board/drc_commands.proto` 改动后）
+
+脚本不依赖预生成的 `*_pb2.py`：它把该 proto 的 `FileDescriptorProto` 在运行时注册进默认 descriptor pool，再用 `message_factory` 取消息类。所以改了 proto 只需重新导出那段 base64（`src/kicad-ipc-executor.ts` 的 `DRC_DESCRIPTOR_B64`）：
+
+```bash
+# 1. 生成含依赖的 descriptor set
+python -m grpc_tools.protoc -I api/proto \
+  --descriptor_set_out=/tmp/drc.desc --include_imports board/drc_commands.proto
+
+# 2. 只取 drc_commands.proto 这一个文件（依赖由 kipy 导入时已注册），转 base64
+python - <<'EOF'
+import base64
+from google.protobuf import descriptor_pb2
+fds = descriptor_pb2.FileDescriptorSet()
+fds.ParseFromString(open('/tmp/drc.desc', 'rb').read())
+target = next(f for f in fds.file if f.name == 'board/drc_commands.proto')
+print(base64.b64encode(target.SerializeToString()).decode())
+EOF
+```
+
+约束：**不要**复用 `kiapi.board.commands` 里已存在的符号名。`DrcSeverity` 已被官方 `board_commands.proto`（`InjectDrcError`）占用，所以本仓库的枚举叫 `DrcViolationSeverity` / `DRCVS_*`；撞名会让两个文件无法同时加载。
 
 ## Web GUI 报告卡片
 
@@ -43,19 +121,24 @@ DRC 成功生成报告后，工具输出会附带一个 `viewUrl`（形如 `/drc
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `executorMode` | `remote` | `local` 或 `remote` |
-| `kicadCliPath` | `''` | local 模式：kicad-cli 绝对路径，留空自动探测 |
-| `pcblintBaseUrl` | `http://47.100.4.100:8080` | remote 模式：pcblint-java 服务地址 |
-| `cliRunnerWorkDirRoot` | `/data/kicad/drc` | remote 模式：cli-runner 工作目录根（共享磁盘） |
+| `executorMode` | `auto` | 默认执行模式：`auto` / `local` / `remote` / `ipc`（非 auto 时不再自动回退） |
+| `backendPriority` | `['remote','local','ipc']` | auto 模式下的后端优先顺序（越靠前越优先）；前一个不可用或执行失败才降级到下一个。内网离线环境可改成 `['local','ipc','remote']` |
+| `kicadCliPath` | `''` | local 后端：kicad-cli 绝对路径，留空自动探测 |
+| `isolatedConfig` | `true` | local 后端：使用隔离的 `KICAD_CONFIG_HOME`（实测省约 5s；关闭后用用户默认配置，库比对类检查更完整） |
+| `ipcPythonPath` | `''` | kicad-ipc 后端使用的 Python 解释器（需装 `kipy`）；留空读 `DSH_KICAD_DRC_PYTHON`，再兜底 `python3`。与 `dsh-kicad` 的 `DSH_KICAD_PYTHON` **刻意分开**：两个插件可能部署在不同机器、对着不同 KiCad 版本 |
+| `pcblintBaseUrl` | `http://47.100.4.100:8080` | remote 后端：pcblint-java 服务地址 |
+| `cliRunnerWorkDirRoot` | `/data/kicad/drc` | remote 后端：cli-runner 工作目录根（共享磁盘） |
 | `fileBaseUrl` | `http://www.fdatasheets.com` | 静态文件服务器域名；配置后通过 HTTP 下载 drc.json，**显式设为空字符串**则从共享磁盘直读（同机/同 PV 部署） |
 | `defaultTimeoutSeconds` | `600` | DRC 默认超时秒数 |
+
+> 用户已显式设置 `KICAD_CONFIG_HOME` 环境变量时，插件不会覆盖它。隔离目录位于 `<系统临时目录>/dsh-kicad-drc/kicad-config`。
 
 ## 开发
 
 ```bash
 pnpm install        # 安装依赖
 pnpm run typecheck  # 类型检查（tsc --noEmit，含 src/client React 代码）
-pnpm test           # 单元测试（node:test，零额外依赖；31 用例）
+pnpm test           # 单元测试（node:test，零额外依赖；69 用例）
 pnpm run build      # tsdown 双入口编译 → lib/index.js（host ESM）+ lib/client.js（浏览器 CJS factory）
 pnpm pack           # 打包 tgz（prepack 自动触发 build）
 ```
@@ -66,6 +149,8 @@ client bundle 是 `window.__ModuleLoader__.load({id, factory})` 包装的 CJS（
 
 ## 已知限制
 
+- 隔离配置会失去用户的全局封装库表，依赖库比对的 DRC 检查可能退化为默认结果（`isolatedConfig: false` 可关）
+- 三个后端的结果**不可直接比较**：本地能读工程规则，remote 只上传单个 `.kicad_pcb`；比较两次 DRC 前先看 `verifiedBy`
 - `--refill-zones` 已在 KiCad 10.0 实测**不会写回原 .kicad_pcb 文件**（仅内存重绘用于检查），但其他版本行为未逐一验证
 - remote 模式的工作目录 `/data/kicad/drc/<jobId>` 插件不主动清理（服务端职责）
 - pcblint-java 接口目前无鉴权，公网暴露时务必在服务端加访问控制；其 `command` 参数由客户端拼接，服务端应做命令白名单校验

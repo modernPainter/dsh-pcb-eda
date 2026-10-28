@@ -12,7 +12,16 @@
  */
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
 import { basename, dirname, resolve, join } from 'node:path'
-import { ExecutorError, type DrcExecutor, type DrcRunOptions, type DrcRunResult } from './executor.ts'
+import {
+  ExecutorError,
+  type BackendHealth,
+  type DrcExecutor,
+  type DrcRunOptions,
+  type DrcRunResult,
+} from './executor.ts'
+
+/** 远程失败后的冷却时间：期间探测判为不可用，让自适应选择优先走本地。 */
+const FAILURE_COOLDOWN_MS = 60_000
 
 /** pcblint-java CliProxyController 的响应结构。 */
 interface CliProxyResponse {
@@ -59,10 +68,13 @@ async function fetchWithRetry(url: string, init: RequestInit, label: string): Pr
 }
 
 export class RemoteExecutor implements DrcExecutor {
+  readonly name = 'remote' as const
   private readonly baseUrl: string
   private readonly workDirRoot: string
   /** null = 共享磁盘读取模式（fileBaseUrl 显式传空字符串时）。 */
   private readonly fileBaseUrl: string | null
+  /** 最近一次失败的时间戳（用于冷却期内降级，避免每次都等 HTTP 超时）。 */
+  private lastFailureAt = 0
 
   constructor(opts: {
     baseUrl?: string
@@ -74,6 +86,29 @@ export class RemoteExecutor implements DrcExecutor {
     this.workDirRoot = (opts.workDirRoot ?? '/data/kicad/drc').replace(/\/$/, '')
     const fbu = opts.fileBaseUrl?.replace(/\/$/, '') ?? 'http://www.fdatasheets.com'
     this.fileBaseUrl = fbu ? fbu : null
+  }
+
+  /**
+   * 探测远程后端可用性。
+   *
+   * 不做 HTTP 探活：每次调用都发健康检查会额外增加延迟，而服务不可用时
+   * `run()` 本身就会快速失败。这里改用"失败冷却"策略——最近一分钟内失败过
+   * 就判为不可用，让自适应选择优先走本地；否则乐观认为可用。
+   */
+  async probe(): Promise<BackendHealth> {
+    const cooling = Date.now() - this.lastFailureAt < FAILURE_COOLDOWN_MS
+    return {
+      backend: 'remote',
+      available: !cooling,
+      endpoint: this.baseUrl,
+      ...(cooling ? { reason: '最近一次远程调用失败，冷却期内降级' } : {}),
+    }
+  }
+
+  /** 记录一次失败（供 probe 在冷却期内降级）。 */
+  private fail(message: string): never {
+    this.lastFailureAt = Date.now()
+    throw new ExecutorError(message)
   }
 
   async run(options: DrcRunOptions): Promise<DrcRunResult> {
@@ -126,13 +161,13 @@ export class RemoteExecutor implements DrcExecutor {
       }, 'pcblint-java 调用')
     } catch (e) {
       clearTimeout(timeoutId)
-      throw new ExecutorError(`pcblint-java HTTP 请求失败: ${(e as Error).message}`)
+      this.fail(`pcblint-java HTTP 请求失败: ${(e as Error).message}`)
     }
     clearTimeout(timeoutId)
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => '')
-      throw new ExecutorError(`pcblint-java 返回 HTTP ${resp.status}: ${text.slice(0, 500)}`)
+      this.fail(`pcblint-java 返回 HTTP ${resp.status}: ${text.slice(0, 500)}`)
     }
 
     const data = (await resp.json()) as CliProxyResponse

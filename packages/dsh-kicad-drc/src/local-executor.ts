@@ -2,12 +2,63 @@
  * 本地 subprocess 执行器：在当前机器上直接调用 kicad-cli。
  */
 import { spawn, execSync } from 'node:child_process'
-import { existsSync, readFileSync, mkdtempSync, rmSync, readdirSync, statSync, copyFileSync } from 'node:fs'
+import { existsSync, readFileSync, mkdtempSync, rmSync, readdirSync, statSync, copyFileSync, mkdirSync } from 'node:fs'
 import { tmpdir, platform, homedir } from 'node:os'
 import { join, dirname, basename, resolve } from 'node:path'
-import { ExecutorError, type DrcExecutor, type DrcRunOptions, type DrcRunResult } from './executor.ts'
+import {
+  ExecutorError,
+  type BackendHealth,
+  type DrcExecutor,
+  type DrcRunOptions,
+  type DrcRunResult,
+} from './executor.ts'
 
 const IS_WIN = platform() === 'win32'
+
+/** kicad-cli 解析失败后的冷却时间：期间直接复用失败结果，不重跑探测链。 */
+const PROBE_FAILURE_COOLDOWN_MS = 60_000
+
+/**
+ * 构造子进程环境变量。
+ *
+ * 传入 `configHome` 时强制设置 `KICAD_CONFIG_HOME`，让 kicad-cli 走"便携配置"
+ * 路径而不是默认配置发现路径。实测（KiCad 10.0.6 / Windows）默认路径会多付
+ * ~5s —— 405KB 板从 6.1s 降到 1.2s，且 DRC 结果逐项一致。
+ *
+ * 为什么不是"内容"问题：把同一个配置目录显式指过去也只要 0.6s，
+ * 说明慢在发现流程本身，而非配置体积。
+ *
+ * 副作用：隔离后拿不到用户的全局封装库表，依赖库比对的检查可能退化为默认结果。
+ * 由插件配置 `isolatedConfig` 控制，并在输出里标注。
+ */
+export function buildChildEnv(
+  configHome?: string,
+  base: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  if (!configHome) return base
+  return { ...base, KICAD_CONFIG_HOME: configHome }
+}
+
+/**
+ * 解析本地后端的隔离配置目录（不存在则创建）。
+ *
+ * 只在显式开启隔离、且用户没有自己设置 KICAD_CONFIG_HOME 时生效——
+ * 用户显式设置代表他有意指定配置目录，插件不该覆盖。
+ */
+export function resolveConfigHome(
+  isolated: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (!isolated) return undefined
+  if (env.KICAD_CONFIG_HOME) return undefined
+  const dir = join(tmpdir(), 'dsh-kicad-drc', 'kicad-config')
+  try {
+    mkdirSync(dir, { recursive: true })
+    return dir
+  } catch {
+    return undefined
+  }
+}
 
 /** 探测 kicad-cli 路径（多级降级策略）。 */
 export function resolveKicadCli(explicit?: string): string {
@@ -297,20 +348,54 @@ function scanCommonInstallDirs(): string | null {
 }
 
 export class LocalExecutor implements DrcExecutor {
+  readonly name = 'local' as const
   private readonly explicitPath?: string
+  /** KICAD_CONFIG_HOME；非空时启用配置隔离（见 buildChildEnv）。 */
+  private readonly configHome?: string
   /** 解析成功的 kicad-cli 路径缓存（懒解析；失败不缓存，下次重新探测）。 */
   private resolvedPath: string | null = null
+  /** 解析失败的缓存：冷却期内直接快速失败，避免每次探测都重跑全盘搜索（上限 30s）。 */
+  private lastFailure: { message: string, at: number } | null = null
 
-  constructor(kicadCliPath?: string) {
+  constructor(kicadCliPath?: string, options: { configHome?: string } = {}) {
     this.explicitPath = kicadCliPath
+    this.configHome = options.configHome
   }
 
-  /** 解析 kicad-cli 路径。首次 run() 时才调用，避免本机没装 KiCad 就拖垮插件启动。 */
+  /**
+   * 解析 kicad-cli 路径。首次 run() 时才调用，避免本机没装 KiCad 就拖垮插件启动。
+   *
+   * 失败结果在冷却期内复用：探测链最后一级是 PowerShell 全盘搜索（上限 30s），
+   * 若本机确实没装 KiCad，每次自适应探测都重跑一遍会让每次工具调用都白白多等半分钟。
+   */
   private resolveCli(): string {
     if (this.resolvedPath) return this.resolvedPath
-    const p = resolveKicadCli(this.explicitPath)
-    this.resolvedPath = p
-    return p
+    if (this.lastFailure && Date.now() - this.lastFailure.at < PROBE_FAILURE_COOLDOWN_MS) {
+      throw new ExecutorError(this.lastFailure.message)
+    }
+    try {
+      const p = resolveKicadCli(this.explicitPath)
+      this.resolvedPath = p
+      this.lastFailure = null
+      return p
+    } catch (e) {
+      this.lastFailure = { message: e instanceof Error ? e.message : String(e), at: Date.now() }
+      throw e
+    }
+  }
+
+  /** 探测本地后端是否可用（不跑 DRC）。解析失败不缓存，下次可重试。 */
+  async probe(): Promise<BackendHealth> {
+    try {
+      return { backend: 'local', available: true, endpoint: this.resolveCli() }
+    } catch (e) {
+      return {
+        backend: 'local',
+        available: false,
+        endpoint: this.explicitPath ?? '',
+        reason: e instanceof Error ? e.message : String(e),
+      }
+    }
   }
 
   async run(options: DrcRunOptions): Promise<DrcRunResult> {
@@ -342,7 +427,7 @@ export class LocalExecutor implements DrcExecutor {
 
     try {
       const { exitCode, stdout, stderr, timedOut } = await execProcess(
-        kicadCliPath, args, workDir, timeoutMs,
+        kicadCliPath, args, workDir, timeoutMs, buildChildEnv(this.configHome),
       )
 
       // 读取 drc.json
@@ -368,7 +453,7 @@ export class LocalExecutor implements DrcExecutor {
       // 构造实际执行的命令行字符串（用于日志/输出展示）
       const command = [kicadCliPath, ...args].map(quoteIfNeeded).join(' ')
 
-      return { exitCode, stdout, stderr, drcJson, elapsedMs, timedOut, kicadCliPath: kicadCliPath, command, drcJsonPath }
+      return { exitCode, stdout, stderr, drcJson, elapsedMs, timedOut, kicadCliPath: kicadCliPath, command, drcJsonPath, ...(this.configHome ? { isolatedConfig: true } : {}) }
     } finally {
       // 清理临时目录
       try { rmSync(workDir, { recursive: true, force: true }) } catch { /* ignore */ }
@@ -386,10 +471,16 @@ function quoteIfNeeded(arg: string): string {
 
 /** 启动子进程并等待结束，超时强杀。 */
 function execProcess(
-  cmd: string, args: string[], cwd: string, timeoutMs: number,
+  cmd: string, args: string[], cwd: string, timeoutMs: number, env?: NodeJS.ProcessEnv,
 ): Promise<{ exitCode: number, stdout: string, stderr: string, timedOut: boolean }> {
   return new Promise((resolvePromise) => {
-    const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] })
+    const child = spawn(cmd, args, {
+      cwd,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      // 不让子进程弹控制台窗口（Windows）；与 stdio 全管道配合更稳
+      windowsHide: true,
+      ...(env ? { env } : {}),
+    })
     let stdout = ''
     let stderr = ''
     let timedOut = false
